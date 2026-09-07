@@ -14,7 +14,7 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # 1. Checkout the Expert Cache experimental branch
+      # 1. Checkout Expert Cache experimental branch
       # ------------------------------------------------------------
       - name: Checkout Expert Cache branch
         uses: actions/checkout@v6
@@ -24,18 +24,15 @@ jobs:
           fetch-depth: 1
 
       # ------------------------------------------------------------
-      # 2. Patch POSIX file locking calls for MSVC / Windows
+      # 2. Patch Windows compatibility issue
       #
-      # The experimental branch currently uses:
+      # The experimental branch uses POSIX:
       #   flockfile()
       #   funlockfile()
       #
       # MSVC uses:
       #   _lock_file()
       #   _unlock_file()
-      #
-      # This patch is safe to re-run and also tolerates the branch
-      # being fixed upstream later.
       # ------------------------------------------------------------
       - name: Patch Expert Cache for Windows
         shell: pwsh
@@ -83,14 +80,19 @@ jobs:
 
           if ($changed) {
               $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-              [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
+              [System.IO.File]::WriteAllText(
+                  $path,
+                  $text,
+                  $utf8NoBom
+              )
+
               Write-Host "Windows compatibility patch applied successfully."
           }
 
       # ------------------------------------------------------------
-      # 3. Install CUDA 13.3
+      # 3. Setup CUDA 13.3
       #
-      # Reuse llama.cpp's own Windows CUDA setup action.
+      # Uses llama.cpp's bundled Windows CUDA setup action.
       # ------------------------------------------------------------
       - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -107,21 +109,16 @@ jobs:
           choco install ninja -y
 
       # ------------------------------------------------------------
-      # 5. Configure
+      # 5. Configure generic Windows CUDA build
       #
-      # IMPORTANT:
-      #   GGML_NATIVE=OFF
+      # GGML_NATIVE=OFF means:
+      # - not tied to GitHub runner CPU
+      # - CMake chooses a generic CUDA architecture set
       #
-      # This means the build is NOT specialized for the GitHub
-      # runner's CPU/GPU and lets llama.cpp choose its generic
-      # CUDA architecture set.
-      #
-      # We intentionally DO NOT set:
-      #   CMAKE_CUDA_ARCHITECTURES=120
-      #   GGML_AVX2
-      #   GGML_AVX512
-      #
-      # So this is no longer a 5070/14600KF-only build.
+      # We intentionally do NOT set:
+      # - CMAKE_CUDA_ARCHITECTURES=120
+      # - AVX2-only CPU build
+      # - AVX512-only CPU build
       # ------------------------------------------------------------
       - name: Configure generic Windows CUDA build
         shell: cmd
@@ -134,7 +131,7 @@ jobs:
             -DLLAMA_CURL=OFF
 
       # ------------------------------------------------------------
-      # 6. Build only the useful executables
+      # 6. Build useful executables only
       # ------------------------------------------------------------
       - name: Build llama.cpp
         shell: cmd
@@ -153,7 +150,7 @@ jobs:
             --target llama-server llama-cli llama-bench
 
       # ------------------------------------------------------------
-      # 7. Verify important binaries were produced
+      # 7. Verify build outputs
       # ------------------------------------------------------------
       - name: Verify build output
         shell: pwsh
@@ -175,7 +172,9 @@ jobs:
 
               if (-not (Test-Path $full)) {
                   Write-Host "Contents of ${bin}:"
-                  Get-ChildItem $bin | Format-Table Name, Length
+                  Get-ChildItem $bin |
+                      Format-Table Name, Length
+
                   throw "Required build output missing: $file"
               }
 
@@ -185,10 +184,13 @@ jobs:
       # ------------------------------------------------------------
       # 8. Bundle CUDA runtime DLLs
       #
-      # This means the downloaded build does NOT require installing
-      # the full CUDA Toolkit on your PC.
+      # Recursive search is required because llama.cpp's CUDA setup
+      # action installs CUDA libraries in nested archive directories.
       #
-      # You still need a sufficiently recent NVIDIA display driver.
+      # This lets the downloaded build run without installing the
+      # full CUDA Toolkit locally.
+      #
+      # A recent NVIDIA driver is still required.
       # ------------------------------------------------------------
       - name: Bundle CUDA runtime DLLs
         shell: pwsh
@@ -196,10 +198,14 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $dest = "build\bin\Release"
-          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          $cudaRoot = $env:CUDA_PATH
 
-          Write-Host "CUDA_PATH = $env:CUDA_PATH"
-          Write-Host "CUDA bin  = $cudaBin"
+          Write-Host "CUDA_PATH = $cudaRoot"
+          Write-Host "Searching CUDA runtime DLLs recursively..."
+
+          if (-not (Test-Path $cudaRoot)) {
+              throw "CUDA_PATH does not exist: $cudaRoot"
+          }
 
           $patterns = @(
               "cudart64_*.dll",
@@ -209,7 +215,9 @@ jobs:
 
           foreach ($pattern in $patterns) {
               $files = Get-ChildItem `
-                  -Path $cudaBin `
+                  -Path $cudaRoot `
+                  -Recurse `
+                  -File `
                   -Filter $pattern `
                   -ErrorAction SilentlyContinue
 
@@ -218,6 +226,8 @@ jobs:
               }
 
               foreach ($file in $files) {
+                  Write-Host "Found: $($file.FullName)"
+
                   Copy-Item `
                       -Path $file.FullName `
                       -Destination $dest `
@@ -226,6 +236,12 @@ jobs:
                   Write-Host "Bundled: $($file.Name)"
               }
           }
+
+          Write-Host ""
+          Write-Host "CUDA runtime DLLs bundled successfully:"
+          Get-ChildItem $dest -Filter "*.dll" |
+              Sort-Object Name |
+              Format-Table Name, Length -AutoSize
 
       # ------------------------------------------------------------
       # 9. Add build information
@@ -236,7 +252,9 @@ jobs:
           $dest = "build\bin\Release"
 
           $commit = git rev-parse HEAD
-          $date = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+          $date = (Get-Date).ToUniversalTime().ToString(
+              "yyyy-MM-dd HH:mm:ss 'UTC'"
+          )
 
           @"
           llama.cpp Expert Cache experimental build
@@ -257,20 +275,21 @@ jobs:
           13.3
 
           Build mode:
-          Generic / GGML_NATIVE=OFF
+          Generic
+          GGML_NATIVE=OFF
 
           Built:
           $date
 
           Windows compatibility patch:
-          flockfile     -> _lock_file
-          funlockfile   -> _unlock_file
+          flockfile   -> _lock_file
+          funlockfile -> _unlock_file
           "@ | Out-File `
               -FilePath "$dest\BUILD-INFO.txt" `
               -Encoding utf8
 
       # ------------------------------------------------------------
-      # 10. Show final artifact contents
+      # 10. Show final package contents
       # ------------------------------------------------------------
       - name: Show package contents
         shell: pwsh
@@ -280,12 +299,14 @@ jobs:
               Format-Table Name, Length -AutoSize
 
       # ------------------------------------------------------------
-      # 11. Upload
+      # 11. Upload artifact
       #
-      # GitHub automatically packages this directory as an artifact,
-      # so there is no need to make another nested ZIP ourselves.
+      # "if: always()" is intentional:
+      # if a late packaging step fails, GitHub will still try to
+      # upload already-compiled executables.
       # ------------------------------------------------------------
       - name: Upload Windows CUDA build
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: llama-expert-cache-win-x64-cuda133-generic
