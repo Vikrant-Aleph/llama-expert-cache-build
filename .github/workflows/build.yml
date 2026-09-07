@@ -1,13 +1,21 @@
-name: Build llama.cpp Expert Cache - Windows CUDA
+name: Build llama.cpp Expert Cache - Windows CUDA Generic
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: Windows x64 - CUDA 13.3 - Generic
     runs-on: windows-2022
+    timeout-minutes: 360
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Checkout the Expert Cache experimental branch
+      # ------------------------------------------------------------
       - name: Checkout Expert Cache branch
         uses: actions/checkout@v6
         with:
@@ -15,53 +23,272 @@ jobs:
           ref: moe-expert-cache
           fetch-depth: 1
 
+      # ------------------------------------------------------------
+      # 2. Patch POSIX file locking calls for MSVC / Windows
+      #
+      # The experimental branch currently uses:
+      #   flockfile()
+      #   funlockfile()
+      #
+      # MSVC uses:
+      #   _lock_file()
+      #   _unlock_file()
+      #
+      # This patch is safe to re-run and also tolerates the branch
+      # being fixed upstream later.
+      # ------------------------------------------------------------
+      - name: Patch Expert Cache for Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $path = "ggml\src\ggml-cpu\ggml-cpu.c"
+
+          if (-not (Test-Path $path)) {
+              throw "Cannot find $path"
+          }
+
+          $text = [System.IO.File]::ReadAllText($path)
+          $changed = $false
+
+          if ($text.Contains("flockfile(moe_log_file);")) {
+              $text = $text.Replace(
+                  "flockfile(moe_log_file);",
+                  "_lock_file(moe_log_file);"
+              )
+              $changed = $true
+              Write-Host "Patched flockfile -> _lock_file"
+          }
+          elseif ($text.Contains("_lock_file(moe_log_file);")) {
+              Write-Host "_lock_file already present; no patch needed."
+          }
+          else {
+              Write-Host "Warning: flockfile(moe_log_file) pattern not found."
+          }
+
+          if ($text.Contains("funlockfile(moe_log_file);")) {
+              $text = $text.Replace(
+                  "funlockfile(moe_log_file);",
+                  "_unlock_file(moe_log_file);"
+              )
+              $changed = $true
+              Write-Host "Patched funlockfile -> _unlock_file"
+          }
+          elseif ($text.Contains("_unlock_file(moe_log_file);")) {
+              Write-Host "_unlock_file already present; no patch needed."
+          }
+          else {
+              Write-Host "Warning: funlockfile(moe_log_file) pattern not found."
+          }
+
+          if ($changed) {
+              $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+              [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
+              Write-Host "Windows compatibility patch applied successfully."
+          }
+
+      # ------------------------------------------------------------
+      # 3. Install CUDA 13.3
+      #
+      # Reuse llama.cpp's own Windows CUDA setup action.
+      # ------------------------------------------------------------
       - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: '13.3'
           cuda_arch: x64
 
+      # ------------------------------------------------------------
+      # 4. Install Ninja
+      # ------------------------------------------------------------
       - name: Install Ninja
-        shell: powershell
-        run: choco install ninja -y
+        shell: pwsh
+        run: |
+          choco install ninja -y
 
-      - name: Build for RTX 50 / SM120
+      # ------------------------------------------------------------
+      # 5. Configure
+      #
+      # IMPORTANT:
+      #   GGML_NATIVE=OFF
+      #
+      # This means the build is NOT specialized for the GitHub
+      # runner's CPU/GPU and lets llama.cpp choose its generic
+      # CUDA architecture set.
+      #
+      # We intentionally DO NOT set:
+      #   CMAKE_CUDA_ARCHITECTURES=120
+      #   GGML_AVX2
+      #   GGML_AVX512
+      #
+      # So this is no longer a 5070/14600KF-only build.
+      # ------------------------------------------------------------
+      - name: Configure generic Windows CUDA build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES=120 ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_AVX=ON ^
-            -DGGML_AVX2=ON ^
-            -DGGML_BMI2=ON ^
-            -DGGML_AVX512=OFF ^
             -DLLAMA_CURL=OFF
 
-          cmake --build build --config Release -j 4
+      # ------------------------------------------------------------
+      # 6. Build only the useful executables
+      # ------------------------------------------------------------
+      - name: Build llama.cpp
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+
+          if %NINJA_JOBS% LSS 1 set NINJA_JOBS=1
+
+          echo Using %NINJA_JOBS% parallel build jobs
+
+          cmake --build build ^
+            --config Release ^
+            -j %NINJA_JOBS% ^
+            --target llama-server llama-cli llama-bench
+
+      # ------------------------------------------------------------
+      # 7. Verify important binaries were produced
+      # ------------------------------------------------------------
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bin = "build\bin\Release"
+
+          $required = @(
+              "llama-server.exe",
+              "llama-cli.exe",
+              "llama-bench.exe",
+              "ggml-cuda.dll",
+              "ggml-cpu.dll"
+          )
+
+          foreach ($file in $required) {
+              $full = Join-Path $bin $file
+
+              if (-not (Test-Path $full)) {
+                  Write-Host "Contents of ${bin}:"
+                  Get-ChildItem $bin | Format-Table Name, Length
+                  throw "Required build output missing: $file"
+              }
+
+              Write-Host "Found: $file"
+          }
+
+      # ------------------------------------------------------------
+      # 8. Bundle CUDA runtime DLLs
+      #
+      # This means the downloaded build does NOT require installing
+      # the full CUDA Toolkit on your PC.
+      #
+      # You still need a sufficiently recent NVIDIA display driver.
+      # ------------------------------------------------------------
       - name: Bundle CUDA runtime DLLs
-        shell: powershell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dest = "build\bin\Release"
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          Write-Host "CUDA bin  = $cudaBin"
+
+          $patterns = @(
+              "cudart64_*.dll",
+              "cublas64_*.dll",
+              "cublasLt64_*.dll"
+          )
+
+          foreach ($pattern in $patterns) {
+              $files = Get-ChildItem `
+                  -Path $cudaBin `
+                  -Filter $pattern `
+                  -ErrorAction SilentlyContinue
+
+              if (-not $files) {
+                  throw "Could not find CUDA runtime DLL matching: $pattern"
+              }
+
+              foreach ($file in $files) {
+                  Copy-Item `
+                      -Path $file.FullName `
+                      -Destination $dest `
+                      -Force
+
+                  Write-Host "Bundled: $($file.Name)"
+              }
+          }
+
+      # ------------------------------------------------------------
+      # 9. Add build information
+      # ------------------------------------------------------------
+      - name: Add build information
+        shell: pwsh
         run: |
           $dest = "build\bin\Release"
 
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cudart64_*.dll" |
-            Copy-Item -Destination $dest
+          $commit = git rev-parse HEAD
+          $date = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
 
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublas64_*.dll" |
-            Copy-Item -Destination $dest
+          @"
+          llama.cpp Expert Cache experimental build
 
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublasLt64_*.dll" |
-            Copy-Item -Destination $dest
+          Source:
+          https://github.com/csantiago78/llama.cpp
 
-          Compress-Archive `
-            -Path "$dest\*" `
-            -DestinationPath "llama-expert-cache-win-cuda133-sm120.zip"
+          Branch:
+          moe-expert-cache
 
-      - name: Upload build
+          Commit:
+          $commit
+
+          Platform:
+          Windows x64
+
+          CUDA:
+          13.3
+
+          Build mode:
+          Generic / GGML_NATIVE=OFF
+
+          Built:
+          $date
+
+          Windows compatibility patch:
+          flockfile     -> _lock_file
+          funlockfile   -> _unlock_file
+          "@ | Out-File `
+              -FilePath "$dest\BUILD-INFO.txt" `
+              -Encoding utf8
+
+      # ------------------------------------------------------------
+      # 10. Show final artifact contents
+      # ------------------------------------------------------------
+      - name: Show package contents
+        shell: pwsh
+        run: |
+          Get-ChildItem "build\bin\Release" |
+              Sort-Object Name |
+              Format-Table Name, Length -AutoSize
+
+      # ------------------------------------------------------------
+      # 11. Upload
+      #
+      # GitHub automatically packages this directory as an artifact,
+      # so there is no need to make another nested ZIP ourselves.
+      # ------------------------------------------------------------
+      - name: Upload Windows CUDA build
         uses: actions/upload-artifact@v6
         with:
-          name: llama-expert-cache-win-cuda133-sm120
-          path: llama-expert-cache-win-cuda133-sm120.zip
+          name: llama-expert-cache-win-x64-cuda133-generic
+          path: build/bin/Release/*
+          retention-days: 7
+          if-no-files-found: error
