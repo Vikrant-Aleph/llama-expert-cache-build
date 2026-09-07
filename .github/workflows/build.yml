@@ -1,0 +1,67 @@
+name: Build llama.cpp Expert Cache - Windows CUDA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout Expert Cache branch
+        uses: actions/checkout@v6
+        with:
+          repository: csantiago78/llama.cpp
+          ref: moe-expert-cache
+          fetch-depth: 1
+
+      - name: Setup CUDA 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        shell: powershell
+        run: choco install ninja -y
+
+      - name: Build for RTX 50 / SM120
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=120 ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX=ON ^
+            -DGGML_AVX2=ON ^
+            -DGGML_BMI2=ON ^
+            -DGGML_AVX512=OFF ^
+            -DLLAMA_CURL=OFF
+
+          cmake --build build --config Release -j 4
+
+      - name: Bundle CUDA runtime DLLs
+        shell: powershell
+        run: |
+          $dest = "build\bin\Release"
+
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cudart64_*.dll" |
+            Copy-Item -Destination $dest
+
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublas64_*.dll" |
+            Copy-Item -Destination $dest
+
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublasLt64_*.dll" |
+            Copy-Item -Destination $dest
+
+          Compress-Archive `
+            -Path "$dest\*" `
+            -DestinationPath "llama-expert-cache-win-cuda133-sm120.zip"
+
+      - name: Upload build
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-expert-cache-win-cuda133-sm120
+          path: llama-expert-cache-win-cuda133-sm120.zip
