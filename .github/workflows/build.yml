@@ -13,7 +13,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
       # ============================================================
       # 1. Checkout Expert Cache experimental branch
       # ============================================================
@@ -25,19 +24,17 @@ jobs:
           fetch-depth: 1
 
       # ============================================================
-      # 2. Windows compatibility patch
+      # 2. Patch Windows compatibility
       #
-      # Experimental branch currently uses POSIX:
-      #
+      # Experimental branch currently uses:
       #   flockfile()
       #   funlockfile()
       #
       # MSVC equivalents:
-      #
       #   _lock_file()
       #   _unlock_file()
       #
-      # If upstream fixes this later, this step will simply skip it.
+      # If upstream fixes this later, this step simply skips it.
       # ============================================================
       - name: Patch Expert Cache for Windows
         shell: pwsh
@@ -54,7 +51,6 @@ jobs:
           $changed = $false
 
           if ($text.Contains("flockfile(moe_log_file);")) {
-
               $text = $text.Replace(
                   "flockfile(moe_log_file);",
                   "_lock_file(moe_log_file);"
@@ -64,17 +60,13 @@ jobs:
               Write-Host "Patched flockfile -> _lock_file"
           }
           elseif ($text.Contains("_lock_file(moe_log_file);")) {
-
-              Write-Host "_lock_file already present. No patch required."
+              Write-Host "_lock_file already present. No patch needed."
           }
           else {
-
               Write-Host "flockfile pattern not found. Possibly fixed upstream."
           }
 
-
           if ($text.Contains("funlockfile(moe_log_file);")) {
-
               $text = $text.Replace(
                   "funlockfile(moe_log_file);",
                   "_unlock_file(moe_log_file);"
@@ -84,17 +76,13 @@ jobs:
               Write-Host "Patched funlockfile -> _unlock_file"
           }
           elseif ($text.Contains("_unlock_file(moe_log_file);")) {
-
-              Write-Host "_unlock_file already present. No patch required."
+              Write-Host "_unlock_file already present. No patch needed."
           }
           else {
-
               Write-Host "funlockfile pattern not found. Possibly fixed upstream."
           }
 
-
           if ($changed) {
-
               $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
               [System.IO.File]::WriteAllText(
@@ -103,13 +91,13 @@ jobs:
                   $utf8NoBom
               )
 
-              Write-Host "Windows compatibility patch applied successfully."
+              Write-Host "Windows compatibility patch applied."
           }
 
       # ============================================================
-      # 3. CUDA 13.3
+      # 3. Setup CUDA 13.3
       #
-      # Use llama.cpp's own CUDA setup action.
+      # Uses the CUDA setup action bundled in llama.cpp.
       # ============================================================
       - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -123,26 +111,24 @@ jobs:
       - name: Install Ninja
         shell: pwsh
         run: |
-          choco install ninja -y
+          choco install ninja -y --no-progress
 
       # ============================================================
-      # 5. Configure
+      # 5. Configure generic Windows CUDA build
       #
-      # GGML_NATIVE=OFF
-      #   Build a generic binary rather than optimizing for the
-      #   GitHub runner CPU.
+      # GGML_NATIVE=OFF:
+      #   Do not optimize for GitHub runner CPU.
       #
-      # LLAMA_CURL=OFF
-      #   Do not require CURL runtime.
+      # No CMAKE_CUDA_ARCHITECTURES override:
+      #   Let llama.cpp choose its generic supported CUDA arch set.
       #
-      # LLAMA_OPENSSL=OFF
-      #   IMPORTANT:
-      #   prevents dependency on:
+      # CURL=OFF:
+      #   Avoid extra libcurl dependencies.
       #
+      # OPENSSL=OFF:
+      #   Avoid:
       #     libcrypto-3-x64.dll
       #     libssl-3-x64.dll
-      #
-      # This is ideal for local GGUF + llama-server usage.
       # ============================================================
       - name: Configure generic Windows CUDA build
         shell: cmd
@@ -158,14 +144,14 @@ jobs:
       # ============================================================
       # 6. Build
       #
-      # Only build the tools we actually want.
+      # Only build tools useful for normal inference / testing.
       # ============================================================
       - name: Build llama.cpp
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
-          echo Available CPU threads: %NUMBER_OF_PROCESSORS%
+          echo CPU threads available: %NUMBER_OF_PROCESSORS%
 
           cmake --build build ^
             --config Release ^
@@ -173,7 +159,7 @@ jobs:
             --target llama-server llama-cli llama-bench
 
       # ============================================================
-      # 7. Verify core build files
+      # 7. Verify build outputs
       # ============================================================
       - name: Verify build output
         shell: pwsh
@@ -187,6 +173,11 @@ jobs:
               "llama-cli.exe",
               "llama-bench.exe",
               "llama.dll",
+              "llama-common.dll",
+              "llama-server-impl.dll",
+              "llama-cli-impl.dll",
+              "llama-bench-impl.dll",
+              "mtmd.dll",
               "ggml.dll",
               "ggml-base.dll",
               "ggml-cpu.dll",
@@ -194,16 +185,14 @@ jobs:
           )
 
           foreach ($file in $required) {
-
               $full = Join-Path $bin $file
 
               if (-not (Test-Path $full)) {
-
                   Write-Host ""
-                  Write-Host "Current build directory:"
+                  Write-Host "Current build directory contents:"
                   Get-ChildItem $bin |
                       Sort-Object Name |
-                      Format-Table Name, Length
+                      Format-Table Name, Length -AutoSize
 
                   throw "Required build output missing: $file"
               }
@@ -214,13 +203,13 @@ jobs:
       # ============================================================
       # 8. Bundle CUDA runtime DLLs
       #
-      # llama.cpp's CUDA installer places packages inside nested
-      # directories, therefore search recursively.
+      # llama.cpp CUDA setup puts runtime components in nested
+      # directories, so search recursively.
       #
-      # The resulting Artifact should NOT require CUDA Toolkit
-      # installed locally.
+      # This allows the downloaded package to run without installing
+      # the full CUDA Toolkit locally.
       #
-      # NVIDIA display driver is still required.
+      # A sufficiently recent NVIDIA driver is still required.
       # ============================================================
       - name: Bundle CUDA runtime DLLs
         shell: pwsh
@@ -230,9 +219,7 @@ jobs:
           $dest = "build\bin\Release"
           $cudaRoot = $env:CUDA_PATH
 
-          Write-Host "CUDA_PATH:"
-          Write-Host $cudaRoot
-          Write-Host ""
+          Write-Host "CUDA_PATH = $cudaRoot"
 
           if (-not (Test-Path $cudaRoot)) {
               throw "CUDA_PATH does not exist: $cudaRoot"
@@ -245,8 +232,8 @@ jobs:
           )
 
           foreach ($pattern in $patterns) {
-
-              Write-Host "Searching for $pattern ..."
+              Write-Host ""
+              Write-Host "Searching for $pattern"
 
               $files = Get-ChildItem `
                   -Path $cudaRoot `
@@ -260,23 +247,19 @@ jobs:
               }
 
               foreach ($file in $files) {
-
-                  Write-Host "Found:"
-                  Write-Host $file.FullName
+                  Write-Host "Found: $($file.FullName)"
 
                   Copy-Item `
                       -Path $file.FullName `
                       -Destination $dest `
                       -Force
 
-                  Write-Host "Copied $($file.Name)"
+                  Write-Host "Copied: $($file.Name)"
               }
-
-              Write-Host ""
           }
 
       # ============================================================
-      # 9. Verify CUDA DLLs in final directory
+      # 9. Verify CUDA DLLs are packaged
       # ============================================================
       - name: Verify CUDA runtime DLLs
         shell: pwsh
@@ -292,7 +275,6 @@ jobs:
           )
 
           foreach ($pattern in $patterns) {
-
               $found = Get-ChildItem `
                   -Path $bin `
                   -Filter $pattern `
@@ -309,14 +291,9 @@ jobs:
           }
 
       # ============================================================
-      # 10. Verify OpenSSL is NOT linked into build configuration
-      #
-      # There should be no need to ship:
-      #
-      #   libcrypto-3-x64.dll
-      #   libssl-3-x64.dll
+      # 10. Verify OpenSSL DLLs are not required/package leftovers
       # ============================================================
-      - name: Verify OpenSSL runtime is not packaged
+      - name: Check OpenSSL runtime
         shell: pwsh
         run: |
           $bin = "build\bin\Release"
@@ -327,17 +304,16 @@ jobs:
           )
 
           foreach ($dll in $opensslDlls) {
-
               if (Test-Path (Join-Path $bin $dll)) {
                   Write-Host "Warning: unexpected OpenSSL DLL exists: $dll"
               }
               else {
-                  Write-Host "[OK] No runtime dependency bundled for $dll"
+                  Write-Host "[OK] Not packaged: $dll"
               }
           }
 
       # ============================================================
-      # 11. Build information
+      # 11. Add build information
       # ============================================================
       - name: Add build information
         shell: pwsh
@@ -345,7 +321,6 @@ jobs:
           $dest = "build\bin\Release"
 
           $commit = git rev-parse HEAD
-
           $date = (Get-Date).ToUniversalTime().ToString(
               "yyyy-MM-dd HH:mm:ss 'UTC'"
           )
@@ -353,9 +328,9 @@ jobs:
           @"
           llama.cpp Expert Cache experimental build
 
-          =========================================================
+          ============================================================
           Source
-          =========================================================
+          ============================================================
 
           Repository:
           https://github.com/csantiago78/llama.cpp
@@ -367,9 +342,9 @@ jobs:
           $commit
 
 
-          =========================================================
+          ============================================================
           Platform
-          =========================================================
+          ============================================================
 
           Windows x64
 
@@ -389,9 +364,9 @@ jobs:
           OFF
 
 
-          =========================================================
+          ============================================================
           Windows compatibility patch
-          =========================================================
+          ============================================================
 
           flockfile
           ->
@@ -402,9 +377,9 @@ jobs:
           _unlock_file
 
 
-          =========================================================
+          ============================================================
           Build time
-          =========================================================
+          ============================================================
 
           $date
           "@ | Out-File `
@@ -412,7 +387,7 @@ jobs:
               -Encoding utf8
 
       # ============================================================
-      # 12. Show package contents
+      # 12. Show final package contents
       # ============================================================
       - name: Show final package contents
         shell: pwsh
@@ -426,11 +401,17 @@ jobs:
               Format-Table Name, Length -AutoSize
 
       # ============================================================
-      # 13. Smoke test
+      # 13. Smoke test executables
       #
-      # Actually launch the binaries before publishing the artifact.
+      # IMPORTANT:
+      # Standard GitHub Windows runners do not have a usable NVIDIA
+      # GPU, so messages such as:
       #
-      # This would have caught the previous 0xC0000135 problem.
+      #   ggml_cuda_init: failed to initialize CUDA
+      #
+      # are EXPECTED here.
+      #
+      # We only verify that Windows can load and start the executables.
       # ============================================================
       - name: Smoke test executables
         shell: pwsh
@@ -440,7 +421,6 @@ jobs:
           Push-Location "build\bin\Release"
 
           try {
-
               Write-Host ""
               Write-Host "========================================"
               Write-Host "Testing llama-server.exe"
@@ -449,7 +429,6 @@ jobs:
               & .\llama-server.exe --version
 
               $code = $LASTEXITCODE
-
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -465,7 +444,6 @@ jobs:
               & .\llama-cli.exe --version
 
               $code = $LASTEXITCODE
-
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -478,10 +456,9 @@ jobs:
               Write-Host "Testing llama-bench.exe"
               Write-Host "========================================"
 
-              & .\llama-bench.exe --version
+              & .\llama-bench.exe --help
 
               $code = $LASTEXITCODE
-
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -491,19 +468,20 @@ jobs:
 
               Write-Host ""
               Write-Host "========================================"
-              Write-Host "ALL SMOKE TESTS PASSED"
+              Write-Host "ALL EXECUTABLE SMOKE TESTS PASSED"
               Write-Host "========================================"
           }
           finally {
-
               Pop-Location
           }
 
       # ============================================================
-      # 14. Upload
+      # 14. Upload Artifact
       #
-      # always() means that if the smoke test fails, the already
-      # compiled files are still uploaded for diagnosis.
+      # always() is intentional.
+      #
+      # If a late smoke-test or packaging step fails, GitHub will
+      # still try to upload the compiled files for diagnosis.
       # ============================================================
       - name: Upload Windows CUDA build
         if: always()
