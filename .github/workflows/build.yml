@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - CUDA 13.4 - thecodacus perf
+    name: Windows x64 - CUDA 13.3 - thecodacus perf
     runs-on: windows-2022
     timeout-minutes: 360
 
@@ -27,82 +27,181 @@ jobs:
           fetch-depth: 1
 
       # ============================================================
-      # 2. Show source revision
+      # 2. Show exact source revision
+      #
+      # Useful because perf is an experimental moving branch.
+      # BUILD-INFO.txt will also record this exact commit.
       # ============================================================
       - name: Show source revision
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Repository: thecodacus/llama.cpp"
           Write-Host "Branch: perf"
           Write-Host ""
+
           git log -1 --oneline
+
+          Write-Host ""
+          Write-Host "Full commit:"
           git rev-parse HEAD
 
       # ============================================================
-      # 3. Setup CUDA
+      # 3. Setup CUDA 13.3
       #
-      # Use CUDA version supported by current llama.cpp Windows CI.
+      # IMPORTANT:
+      # The thecodacus/perf branch's bundled Windows CUDA setup
+      # action supports CUDA 13.3 x64.
+      #
+      # CUDA 13.4 x64 was NOT supported by the revision tested,
+      # causing the action to silently skip CUDA installation.
       # ============================================================
-      - name: Setup CUDA 13.4
+      - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '13.4'
+          cuda_version: '13.3'
           cuda_arch: x64
 
       # ============================================================
-      # 4. Install Ninja
+      # 4. Verify CUDA installation
+      #
+      # Fail immediately if the CUDA setup action did not actually
+      # install nvcc or configure CUDA_PATH.
+      # ============================================================
+      - name: Verify CUDA installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "CUDA environment"
+          Write-Host "========================================"
+          Write-Host ""
+
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          Write-Host ""
+
+          if (-not $env:CUDA_PATH) {
+              throw "CUDA_PATH is not set. CUDA installation failed."
+          }
+
+          if (-not (Test-Path $env:CUDA_PATH)) {
+              throw "CUDA_PATH does not exist: $env:CUDA_PATH"
+          }
+
+          Write-Host "nvcc location:"
+          Get-Command nvcc -ErrorAction Stop
+
+          Write-Host ""
+          Write-Host "nvcc version:"
+          nvcc --version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "nvcc --version failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "[OK] CUDA installation verified."
+
+      # ============================================================
+      # 5. Install Ninja
       # ============================================================
       - name: Install Ninja
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           choco install ninja -y --no-progress
 
+          Write-Host ""
+          Write-Host "Ninja version:"
+          ninja --version
+
       # ============================================================
-      # 5. Configure generic Windows CUDA build
+      # 6. Configure generic Windows CUDA build
       #
       # GGML_CUDA=ON
       #   Enable NVIDIA CUDA backend.
       #
       # GGML_NATIVE=OFF
-      #   Do not optimize specifically for GitHub runner CPU.
+      #   Do not optimize specifically for the GitHub runner CPU.
+      #   This makes the package more portable between Windows PCs.
+      #
+      # CUDAToolkit_ROOT
+      #   Explicitly tell CMake where CUDA was installed.
       #
       # LLAMA_OPENSSL=OFF
-      #   Avoid OpenSSL DLL dependency.
+      #   Avoid unnecessary OpenSSL runtime DLL dependencies.
       #
-      # Expert-cache / prefetch features are runtime features.
-      # They do NOT need special CMake build flags here.
+      # Expert Cache / Prefetch / pinned host memory features are
+      # runtime features in the perf branch and do not require a
+      # special CMake option here.
       # ============================================================
       - name: Configure Windows CUDA build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
+          echo.
+          echo ========================================
+          echo Build environment
+          echo ========================================
+          echo.
+          echo CUDA_PATH=%CUDA_PATH%
+          echo.
+
+          where nvcc
+          if errorlevel 1 exit /b 1
+
+          nvcc --version
+          if errorlevel 1 exit /b 1
+
+          echo.
+          cmake --version
+          ninja --version
+          echo.
+
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF ^
+            -DCUDAToolkit_ROOT="%CUDA_PATH%" ^
             -DLLAMA_OPENSSL=OFF
 
+          if errorlevel 1 exit /b 1
+
       # ============================================================
-      # 6. Build
+      # 7. Build
+      #
+      # Build only the tools normally needed for inference,
+      # server use and benchmarking.
       # ============================================================
       - name: Build llama.cpp
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
+          echo.
           echo CPU threads available: %NUMBER_OF_PROCESSORS%
+          echo.
 
           cmake --build build ^
             --config Release ^
             -j %NUMBER_OF_PROCESSORS% ^
             --target llama-server llama-cli llama-bench
 
+          if errorlevel 1 exit /b 1
+
       # ============================================================
-      # 7. Verify essential outputs
+      # 8. Verify essential build outputs
       #
-      # Avoid checking every internal "*-impl.dll" because those
-      # names can change as the experimental branch tracks upstream.
-      # Smoke tests below will catch missing runtime dependencies.
+      # Only check stable/core filenames here.
+      #
+      # Experimental branches can rename internal implementation
+      # DLLs, so we avoid requiring every *-impl.dll by name.
+      #
+      # The smoke tests later will catch missing DLL dependencies.
       # ============================================================
       - name: Verify build output
         shell: pwsh
@@ -131,7 +230,10 @@ jobs:
 
               if (-not (Test-Path $full)) {
                   Write-Host ""
-                  Write-Host "Current build directory contents:"
+                  Write-Host "========================================"
+                  Write-Host "Current build directory contents"
+                  Write-Host "========================================"
+                  Write-Host ""
 
                   Get-ChildItem $bin |
                       Sort-Object Name |
@@ -144,12 +246,14 @@ jobs:
           }
 
       # ============================================================
-      # 8. Verify this really contains MoE expert-cache support
+      # 9. Inspect available MoE / Expert Cache options
       #
-      # perf is experimental, so fail clearly if the feature gets
-      # renamed/removed from a future branch revision.
+      # perf is a moving experimental branch.
+      #
+      # We search --help for relevant features but DO NOT fail the
+      # build if a future revision renames the CLI options.
       # ============================================================
-      - name: Verify MoE performance features
+      - name: Inspect MoE performance features
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -157,31 +261,54 @@ jobs:
           Push-Location "build\bin\Release"
 
           try {
+              Write-Host ""
+              Write-Host "========================================"
+              Write-Host "Inspecting llama-server options"
+              Write-Host "========================================"
+              Write-Host ""
+
               $help = (& .\llama-server.exe --help 2>&1 | Out-String)
 
-              Write-Host "Searching llama-server help for MoE expert cache..."
+              $keywords = @(
+                  "expert",
+                  "moe",
+                  "cache",
+                  "prefetch"
+              )
 
-              if ($help -match "moe-expert-cache") {
-                  Write-Host "[OK] MoE expert-cache option detected."
-              }
-              else {
+              foreach ($keyword in $keywords) {
                   Write-Host ""
-                  Write-Host "WARNING:"
-                  Write-Host "Could not find 'moe-expert-cache' in llama-server --help."
-                  Write-Host ""
-                  Write-Host "The perf branch may have renamed its options."
-                  Write-Host "Build will continue so the artifact can still be inspected."
+                  Write-Host "Searching for: $keyword"
+
+                  $matches = $help -split "`r?`n" |
+                      Where-Object {
+                          $_ -match [regex]::Escape($keyword)
+                      }
+
+                  if ($matches) {
+                      foreach ($line in $matches) {
+                          Write-Host $line
+                      }
+                  }
+                  else {
+                      Write-Host "No help entry found."
+                  }
               }
+
+              Write-Host ""
+              Write-Host "Feature inspection completed."
           }
           finally {
               Pop-Location
           }
 
       # ============================================================
-      # 9. Bundle CUDA runtime DLLs
+      # 10. Bundle CUDA runtime DLLs
       #
-      # Target machine does not need full CUDA Toolkit.
-      # It still needs a sufficiently recent NVIDIA driver.
+      # This allows the downloaded artifact to run without requiring
+      # the full CUDA Toolkit on the target Windows machine.
+      #
+      # A sufficiently recent NVIDIA driver is still required.
       # ============================================================
       - name: Bundle CUDA runtime DLLs
         shell: pwsh
@@ -191,10 +318,11 @@ jobs:
           $dest = "build\bin\Release"
           $cudaRoot = $env:CUDA_PATH
 
+          Write-Host ""
           Write-Host "CUDA_PATH = $cudaRoot"
 
           if (-not $cudaRoot) {
-              throw "CUDA_PATH is empty"
+              throw "CUDA_PATH is empty."
           }
 
           if (-not (Test-Path $cudaRoot)) {
@@ -209,7 +337,9 @@ jobs:
 
           foreach ($pattern in $patterns) {
               Write-Host ""
+              Write-Host "========================================"
               Write-Host "Searching for $pattern"
+              Write-Host "========================================"
 
               $files = Get-ChildItem `
                   -Path $cudaRoot `
@@ -219,31 +349,35 @@ jobs:
                   -ErrorAction SilentlyContinue
 
               if (-not $files) {
-                  throw "Could not find CUDA DLL matching: $pattern"
+                  throw "Could not find CUDA runtime DLL matching: $pattern"
               }
 
-              # There can occasionally be duplicate copies in nested
-              # toolkit directories. Package unique DLL names only.
-              $files = $files |
+              # CUDA packages may contain duplicate copies of a DLL
+              # in nested directories.
+              #
+              # Keep one file for each unique DLL filename.
+              $uniqueFiles = $files |
                   Group-Object Name |
                   ForEach-Object {
                       $_.Group | Select-Object -First 1
                   }
 
-              foreach ($file in $files) {
-                  Write-Host "Found: $($file.FullName)"
+              foreach ($file in $uniqueFiles) {
+                  Write-Host "Found:"
+                  Write-Host "  $($file.FullName)"
 
                   Copy-Item `
                       -Path $file.FullName `
                       -Destination $dest `
                       -Force
 
-                  Write-Host "Copied: $($file.Name)"
+                  Write-Host "Copied:"
+                  Write-Host "  $($file.Name)"
               }
           }
 
       # ============================================================
-      # 10. Verify CUDA DLLs
+      # 11. Verify CUDA DLLs are packaged
       # ============================================================
       - name: Verify CUDA runtime DLLs
         shell: pwsh
@@ -275,7 +409,10 @@ jobs:
           }
 
       # ============================================================
-      # 11. Check OpenSSL DLLs
+      # 12. Check OpenSSL runtime
+      #
+      # OpenSSL is disabled during CMake configuration.
+      # Warn if OpenSSL DLLs unexpectedly appear in the package.
       # ============================================================
       - name: Check OpenSSL runtime
         shell: pwsh
@@ -297,15 +434,19 @@ jobs:
           }
 
       # ============================================================
-      # 12. Add build information
+      # 13. Add build information
       # ============================================================
       - name: Add build information
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $dest = "build\bin\Release"
 
           $commit = git rev-parse HEAD
           $shortCommit = git rev-parse --short HEAD
+
+          $commitInfo = git log -1 --pretty=format:"%h %s"
 
           $date = (Get-Date).ToUniversalTime().ToString(
               "yyyy-MM-dd HH:mm:ss 'UTC'"
@@ -313,6 +454,7 @@ jobs:
 
           @"
           thecodacus llama.cpp experimental performance build
+
 
           ============================================================
           Source
@@ -330,18 +472,22 @@ jobs:
           Short commit:
           $shortCommit
 
+          Commit description:
+          $commitInfo
+
 
           ============================================================
           Platform
           ============================================================
 
-          Windows x64
+          Windows:
+          x64
+
+          Build configuration:
+          Release
 
           CUDA:
-          13.4
-
-          Build:
-          Release
+          13.3
 
           GGML_CUDA:
           ON
@@ -361,12 +507,35 @@ jobs:
 
           thecodacus/llama.cpp:perf
 
-          Experimental MoE optimizations are controlled at runtime.
+
+          This is an experimental performance branch.
+
+          MoE Expert Cache, asynchronous expert prefetch,
+          pinned host memory and related experimental optimizations
+          may be controlled at runtime depending on the exact
+          revision of the perf branch.
+
+
           Check the exact options supported by this build with:
 
           llama-server.exe --help
+
           llama-cli.exe --help
+
           llama-bench.exe --help
+
+
+          ============================================================
+          CUDA runtime
+          ============================================================
+
+          CUDA runtime DLLs are bundled in this directory.
+
+          Installing the complete CUDA Toolkit on the target machine
+          should therefore not be required.
+
+          A sufficiently recent NVIDIA Windows driver is still
+          required.
 
 
           ============================================================
@@ -379,13 +548,49 @@ jobs:
               -Encoding utf8
 
       # ============================================================
-      # 13. Show final package
+      # 14. Save llama-server help
+      #
+      # Helpful because this experimental branch can change options.
+      # The user can inspect the exact supported parameters without
+      # needing to remember which commit was built.
+      # ============================================================
+      - name: Save command line help
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Push-Location "build\bin\Release"
+
+          try {
+              & .\llama-server.exe --help 2>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-SERVER-HELP.txt" `
+                      -Encoding utf8
+
+              & .\llama-cli.exe --help 2>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-CLI-HELP.txt" `
+                      -Encoding utf8
+
+              & .\llama-bench.exe --help 2>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-BENCH-HELP.txt" `
+                      -Encoding utf8
+          }
+          finally {
+              Pop-Location
+          }
+
+      # ============================================================
+      # 15. Show final package contents
       # ============================================================
       - name: Show final package contents
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "Final package:"
+          Write-Host "========================================"
+          Write-Host "Final package"
+          Write-Host "========================================"
           Write-Host ""
 
           Get-ChildItem "build\bin\Release" |
@@ -393,12 +598,19 @@ jobs:
               Format-Table Name, Length -AutoSize
 
       # ============================================================
-      # 14. Smoke test
+      # 16. Smoke test executables
       #
-      # GitHub hosted Windows runners do not provide a usable
-      # NVIDIA GPU. CUDA initialization failure is therefore expected.
+      # Standard GitHub-hosted Windows runners do not provide a
+      # usable NVIDIA GPU.
       #
-      # What matters here is that Windows can load all binaries/DLLs.
+      # CUDA initialization warnings/errors caused solely by the
+      # absence of a physical NVIDIA GPU can therefore be expected.
+      #
+      # The goal here is primarily to verify that:
+      #
+      #   - Windows can load the executable.
+      #   - Required DLLs are present.
+      #   - The executable can start.
       # ============================================================
       - name: Smoke test executables
         shell: pwsh
@@ -412,10 +624,13 @@ jobs:
               Write-Host "========================================"
               Write-Host "Testing llama-server.exe"
               Write-Host "========================================"
+              Write-Host ""
 
               & .\llama-server.exe --version
 
               $code = $LASTEXITCODE
+
+              Write-Host ""
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -427,10 +642,13 @@ jobs:
               Write-Host "========================================"
               Write-Host "Testing llama-cli.exe"
               Write-Host "========================================"
+              Write-Host ""
 
               & .\llama-cli.exe --version
 
               $code = $LASTEXITCODE
+
+              Write-Host ""
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -442,10 +660,13 @@ jobs:
               Write-Host "========================================"
               Write-Host "Testing llama-bench.exe"
               Write-Host "========================================"
+              Write-Host ""
 
               & .\llama-bench.exe --help
 
               $code = $LASTEXITCODE
+
+              Write-Host ""
               Write-Host "Exit code: $code"
 
               if ($code -ne 0) {
@@ -463,13 +684,18 @@ jobs:
           }
 
       # ============================================================
-      # 15. Upload Artifact
+      # 17. Upload Artifact
+      #
+      # always() is intentional.
+      #
+      # If a late smoke test fails, GitHub will still attempt to
+      # upload the compiled package for diagnosis.
       # ============================================================
       - name: Upload Windows CUDA perf build
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: llama-thecodacus-perf-win-x64-cuda134-generic
+          name: llama-thecodacus-perf-win-x64-cuda133-generic
           path: build/bin/Release/*
           retention-days: 7
           if-no-files-found: error
