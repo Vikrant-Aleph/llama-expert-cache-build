@@ -13,11 +13,17 @@ jobs:
     timeout-minutes: 360
 
     env:
-      # Enable GitHub Actions backed compiler cache.
+      # sccache is used ONLY for normal C/C++ compilation.
       #
-      # This allows successful C/C++/CUDA compilations to be reused
-      # on later workflow runs even though GitHub-hosted runners use
-      # a fresh VM for every job.
+      # IMPORTANT:
+      # Do NOT use sccache as the CUDA/NVCC compiler launcher.
+      #
+      # sccache 0.18.0 currently has an open bug with llama.cpp's
+      # default PTX-only compute_90 architecture:
+      #
+      #   Missing "cubin" file output
+      #
+      # CUDA therefore uses nvcc directly.
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -27,8 +33,6 @@ jobs:
       # Every NEW workflow run pulls the current HEAD of:
       #
       #   thecodacus/llama.cpp:perf
-      #
-      # This intentionally tracks the moving experimental branch.
       # ============================================================
       - name: Checkout thecodacus perf branch
         uses: actions/checkout@v6
@@ -77,10 +81,8 @@ jobs:
       # ============================================================
       # 3. Setup CUDA 13.3
       #
-      # The current thecodacus/perf revision being tested contains
-      # an x64 CUDA 13.3 setup path.
-      #
-      # We deliberately use the action bundled with this fork.
+      # Use the CUDA setup action included with the perf branch.
+      # This branch currently supports CUDA 13.3 x64.
       # ============================================================
       - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -91,8 +93,6 @@ jobs:
 
       # ============================================================
       # 4. Verify CUDA installation
-      #
-      # Fail early if the setup action did not actually install nvcc.
       # ============================================================
       - name: Verify CUDA installation
         shell: pwsh
@@ -116,12 +116,11 @@ jobs:
               throw "CUDA_PATH does not exist: $env:CUDA_PATH"
           }
 
-          $nvcc = Get-Command nvcc -ErrorAction Stop
+          Write-Host "nvcc location:"
+          Get-Command nvcc -ErrorAction Stop
 
-          Write-Host "nvcc:"
-          Write-Host $nvcc.Source
           Write-Host ""
-
+          Write-Host "nvcc version:"
           nvcc --version
 
           if ($LASTEXITCODE -ne 0) {
@@ -150,15 +149,14 @@ jobs:
       # ============================================================
       # 6. Setup sccache
       #
-      # This is the "resume-like" compiler cache.
+      # IMPORTANT:
       #
-      # GitHub-hosted runners are disposable, so a failed workflow
-      # cannot literally resume on the same VM.
+      # sccache is used ONLY for:
       #
-      # sccache stores successful compiler results and allows later
-      # workflow runs to reuse them.
+      #   C
+      #   C++
       #
-      # v0.18.0 contains CUDA 13.3 / Windows NVCC fixes.
+      # CUDA/NVCC is deliberately NOT wrapped by sccache.
       # ============================================================
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
@@ -184,8 +182,9 @@ jobs:
 
           Write-Host "sccache location:"
           Write-Host $sccache.Source
-          Write-Host ""
 
+          Write-Host ""
+          Write-Host "sccache version:"
           sccache --version
 
           if ($LASTEXITCODE -ne 0) {
@@ -204,16 +203,26 @@ jobs:
       #   Enable NVIDIA CUDA backend.
       #
       # GGML_NATIVE=OFF
-      #   Do not optimize for the GitHub runner CPU.
+      #   Do not optimize specifically for the GitHub runner CPU.
       #
       # LLAMA_CURL=OFF
-      #   Avoid unnecessary curl runtime dependencies.
+      #   Avoid unnecessary curl dependencies.
       #
       # LLAMA_OPENSSL=OFF
       #   Avoid OpenSSL runtime DLL dependencies.
       #
-      # CMAKE_*_COMPILER_LAUNCHER=sccache
-      #   Cache MSVC and NVCC compilation results between runs.
+      # CMAKE_C_COMPILER_LAUNCHER=sccache
+      # CMAKE_CXX_COMPILER_LAUNCHER=sccache
+      #
+      #   Cache normal C/C++ compilation.
+      #
+      # IMPORTANT:
+      #
+      # There is intentionally NO:
+      #
+      #   CMAKE_CUDA_COMPILER_LAUNCHER=sccache
+      #
+      # CUDA must go directly through NVCC.
       # ============================================================
       - name: Configure Windows CUDA build
         shell: cmd
@@ -254,8 +263,7 @@ jobs:
             -DLLAMA_OPENSSL=OFF ^
             -DCUDAToolkit_ROOT="%CUDA_PATH%" ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
           if errorlevel 1 exit /b 1
 
@@ -263,9 +271,9 @@ jobs:
       # ============================================================
       # 9. Build
       #
-      # If this step fails halfway through, successful compilation
-      # units already handled by sccache can be reused on a later
-      # NEW workflow run.
+      # CUDA is compiled directly by nvcc.
+      #
+      # This avoids the current sccache + PTX compute_90 bug.
       # ============================================================
       - name: Build llama.cpp
         id: build
@@ -293,8 +301,10 @@ jobs:
       # ============================================================
       # 10. Show sccache statistics
       #
-      # always() means we still get useful cache information even
-      # when the compiler fails.
+      # Only C/C++ compilation is expected in the cache.
+      #
+      # CUDA cache entries should be zero because NVCC bypasses
+      # sccache intentionally.
       # ============================================================
       - name: Show sccache statistics
         if: always()
@@ -362,11 +372,8 @@ jobs:
       # ============================================================
       # 12. Bundle CUDA runtime DLLs
       #
-      # IMPORTANT:
-      # Do this BEFORE running informational executable checks.
-      #
-      # The resulting artifact should not require a full CUDA Toolkit
-      # installation on the destination machine.
+      # Allows the downloaded package to run without installing the
+      # complete CUDA Toolkit on the destination PC.
       #
       # A sufficiently recent NVIDIA driver is still required.
       # ============================================================
@@ -385,7 +392,6 @@ jobs:
           Write-Host ""
 
           Write-Host "CUDA_PATH = $cudaRoot"
-          Write-Host ""
 
           if (-not $cudaRoot) {
               throw "CUDA_PATH is empty."
@@ -419,7 +425,7 @@ jobs:
               # CUDA installation directories can contain duplicate
               # copies of the same DLL filename.
               #
-              # Package only one copy of each unique filename.
+              # Keep one copy for each unique filename.
               $uniqueFiles = $files |
                   Group-Object Name |
                   ForEach-Object {
@@ -442,7 +448,7 @@ jobs:
 
 
       # ============================================================
-      # 13. Verify packaged CUDA DLLs
+      # 13. Verify packaged CUDA runtime DLLs
       # ============================================================
       - name: Verify CUDA runtime DLLs
         shell: pwsh
@@ -498,17 +504,11 @@ jobs:
 
 
       # ============================================================
-      # 15. Inspect MoE / Expert Cache related source markers
+      # 15. Inspect MoE / Expert Cache source markers
       #
-      # IMPORTANT:
+      # INFORMATIONAL ONLY.
       #
-      # This is intentionally INFORMATIONAL ONLY.
-      #
-      # The previous workflow incorrectly treated llama-server
-      # --help returning exit code 1 as a build failure.
-      #
-      # We no longer allow a diagnostic feature inspection to fail
-      # an otherwise successful 2+ hour compilation.
+      # This step must never make a successful build fail.
       # ============================================================
       - name: Inspect MoE performance feature markers
         shell: pwsh
@@ -533,7 +533,6 @@ jobs:
               Write-Host ""
               Write-Host "Searching source for:"
               Write-Host "  $pattern"
-              Write-Host ""
 
               $result = git grep -n -i -E $pattern 2>$null
 
@@ -552,18 +551,17 @@ jobs:
           Write-Host ""
           Write-Host "Feature inspection is informational only."
 
-          # Explicitly clear any exit code left by git grep.
           $global:LASTEXITCODE = 0
-
           exit 0
 
 
       # ============================================================
       # 16. Save command-line help
       #
-      # Some experimental builds return exit code 1 for --help.
+      # Some experimental builds return a nonzero exit code for
+      # --help.
       #
-      # Therefore help generation is NEVER allowed to fail the job.
+      # This step is informational and must NOT fail the workflow.
       # ============================================================
       - name: Save command line help
         shell: pwsh
@@ -582,12 +580,10 @@ jobs:
                       -FilePath "LLAMA-SERVER-HELP.txt" `
                       -Encoding utf8
 
-              $serverHelpCode = $LASTEXITCODE
+              Write-Host "llama-server --help exit code: $LASTEXITCODE"
 
-              Write-Host "llama-server --help exit code: $serverHelpCode"
+
               Write-Host ""
-
-
               Write-Host "Saving llama-cli help..."
 
               & .\llama-cli.exe --help *>&1 |
@@ -595,12 +591,10 @@ jobs:
                       -FilePath "LLAMA-CLI-HELP.txt" `
                       -Encoding utf8
 
-              $cliHelpCode = $LASTEXITCODE
+              Write-Host "llama-cli --help exit code: $LASTEXITCODE"
 
-              Write-Host "llama-cli --help exit code: $cliHelpCode"
+
               Write-Host ""
-
-
               Write-Host "Saving llama-bench help..."
 
               & .\llama-bench.exe --help *>&1 |
@@ -608,16 +602,12 @@ jobs:
                       -FilePath "LLAMA-BENCH-HELP.txt" `
                       -Encoding utf8
 
-              $benchHelpCode = $LASTEXITCODE
-
-              Write-Host "llama-bench --help exit code: $benchHelpCode"
+              Write-Host "llama-bench --help exit code: $LASTEXITCODE"
           }
           finally {
               Pop-Location
           }
 
-          # Help is informational.
-          # Do not propagate native application's exit code.
           $global:LASTEXITCODE = 0
 
           exit 0
@@ -635,6 +625,7 @@ jobs:
 
           $commit = (git rev-parse HEAD).Trim()
           $shortCommit = (git rev-parse --short HEAD).Trim()
+
           $commitInfo = git log -1 --pretty=format:"%h %s"
 
           $date = (Get-Date).ToUniversalTime().ToString(
@@ -699,19 +690,21 @@ jobs:
           ============================================================
 
           sccache:
-          enabled
+          enabled for C and C++ only
 
-          sccache backend:
-          GitHub Actions cache
+          CUDA/NVCC sccache:
+          disabled
 
-          C compiler cache:
-          enabled
+          Reason:
 
-          C++ compiler cache:
-          enabled
+          sccache 0.18.0 has an open issue with llama.cpp's
+          PTX-only compute_90 CUDA architecture.
 
-          CUDA/NVCC compiler cache:
-          enabled
+          The failure appears as:
+
+          Missing "cubin" file output
+
+          CUDA compilation therefore uses NVCC directly.
 
 
           ============================================================
@@ -728,6 +721,7 @@ jobs:
           The exact Expert Cache / prefetch / pinned-memory behavior
           depends on the source commit listed above.
 
+
           Check:
 
           LLAMA-SERVER-HELP.txt
@@ -743,7 +737,7 @@ jobs:
 
           CUDA runtime DLLs are bundled with this package.
 
-          A complete CUDA Toolkit installation on the destination
+          Installing the complete CUDA Toolkit on the destination
           Windows machine should therefore not be required.
 
           A sufficiently recent NVIDIA driver is still required.
@@ -779,18 +773,14 @@ jobs:
       # ============================================================
       # 19. Smoke test executables
       #
-      # GitHub Windows hosted runners do not provide a usable NVIDIA
-      # GPU.
+      # Standard GitHub Windows runners do not provide a usable
+      # NVIDIA GPU.
       #
-      # Therefore this test primarily verifies:
+      # Therefore this is primarily a Windows executable/DLL load
+      # test.
       #
-      #   - EXE can be launched by Windows
-      #   - DLL loading does not immediately fail
-      #
-      # Exit code 1 or 2 is tolerated because experimental binaries
-      # can return a nonzero status when no usable CUDA GPU exists.
-      #
-      # Windows loader / crash style exit codes are still rejected.
+      # Small positive exit codes are tolerated because experimental
+      # builds can return nonzero when no CUDA device is available.
       # ============================================================
       - name: Smoke test executables
         shell: pwsh
@@ -826,32 +816,26 @@ jobs:
 
                   Write-Host "Exit code: $code"
 
-                  # Normal successful execution.
                   if ($code -eq 0) {
                       Write-Host "[OK] $Exe started successfully."
                       return
                   }
 
-                  # Small positive exit codes are tolerated here.
-                  # They can occur when a hosted runner has no usable
-                  # NVIDIA device or an experimental tool treats the
-                  # selected informational option as non-success.
+                  # Tolerate normal small nonzero exit codes.
                   if ($code -ge 1 -and $code -le 10) {
                       Write-Host "Warning: $Exe started but returned $code."
                       Write-Host "This is tolerated on the GitHub hosted runner."
                       return
                   }
 
-                  # Large / negative exit codes are typical of
-                  # Windows loader failures, crashes or NTSTATUS codes.
+                  # Large/negative codes are more likely to indicate
+                  # loader failures, crashes or Windows NTSTATUS.
                   throw "$Exe failed abnormally with exit code $code"
               }
-
 
               Test-LlamaExecutable ".\llama-server.exe"
               Test-LlamaExecutable ".\llama-cli.exe"
               Test-LlamaExecutable ".\llama-bench.exe"
-
 
               Write-Host ""
               Write-Host "========================================"
@@ -862,8 +846,6 @@ jobs:
               Pop-Location
           }
 
-          # Do not leave a tolerated native exit code as the final
-          # PowerShell process exit code.
           $global:LASTEXITCODE = 0
 
           exit 0
@@ -875,7 +857,7 @@ jobs:
       # always() is intentional.
       #
       # If compilation or a late packaging check fails, GitHub still
-      # attempts to upload whatever useful files were generated.
+      # attempts to upload any useful generated files.
       # ============================================================
       - name: Upload Windows CUDA perf build
         if: always()
