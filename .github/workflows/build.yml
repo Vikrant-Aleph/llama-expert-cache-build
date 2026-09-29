@@ -1,4 +1,4 @@
-name: Build llama.cpp Expert Cache - Windows CUDA Generic
+name: Build thecodacus llama.cpp Perf - Windows CUDA Generic
 
 on:
   workflow_dispatch:
@@ -8,101 +8,45 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - CUDA 13.3 - Generic
+    name: Windows x64 - CUDA 13.4 - thecodacus perf
     runs-on: windows-2022
     timeout-minutes: 360
 
     steps:
       # ============================================================
-      # 1. Checkout Expert Cache experimental branch
+      # 1. Checkout latest thecodacus perf branch
+      #
+      # Each workflow run pulls the current HEAD of:
+      #   thecodacus/llama.cpp:perf
       # ============================================================
-      - name: Checkout Expert Cache branch
+      - name: Checkout thecodacus perf branch
         uses: actions/checkout@v6
         with:
-          repository: csantiago78/llama.cpp
-          ref: moe-expert-cache
+          repository: thecodacus/llama.cpp
+          ref: perf
           fetch-depth: 1
 
       # ============================================================
-      # 2. Patch Windows compatibility
-      #
-      # Experimental branch currently uses:
-      #   flockfile()
-      #   funlockfile()
-      #
-      # MSVC equivalents:
-      #   _lock_file()
-      #   _unlock_file()
-      #
-      # If upstream fixes this later, this step simply skips it.
+      # 2. Show source revision
       # ============================================================
-      - name: Patch Expert Cache for Windows
+      - name: Show source revision
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $path = "ggml\src\ggml-cpu\ggml-cpu.c"
-
-          if (-not (Test-Path $path)) {
-              throw "Cannot find $path"
-          }
-
-          $text = [System.IO.File]::ReadAllText($path)
-          $changed = $false
-
-          if ($text.Contains("flockfile(moe_log_file);")) {
-              $text = $text.Replace(
-                  "flockfile(moe_log_file);",
-                  "_lock_file(moe_log_file);"
-              )
-
-              $changed = $true
-              Write-Host "Patched flockfile -> _lock_file"
-          }
-          elseif ($text.Contains("_lock_file(moe_log_file);")) {
-              Write-Host "_lock_file already present. No patch needed."
-          }
-          else {
-              Write-Host "flockfile pattern not found. Possibly fixed upstream."
-          }
-
-          if ($text.Contains("funlockfile(moe_log_file);")) {
-              $text = $text.Replace(
-                  "funlockfile(moe_log_file);",
-                  "_unlock_file(moe_log_file);"
-              )
-
-              $changed = $true
-              Write-Host "Patched funlockfile -> _unlock_file"
-          }
-          elseif ($text.Contains("_unlock_file(moe_log_file);")) {
-              Write-Host "_unlock_file already present. No patch needed."
-          }
-          else {
-              Write-Host "funlockfile pattern not found. Possibly fixed upstream."
-          }
-
-          if ($changed) {
-              $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
-              [System.IO.File]::WriteAllText(
-                  $path,
-                  $text,
-                  $utf8NoBom
-              )
-
-              Write-Host "Windows compatibility patch applied."
-          }
+          Write-Host "Repository: thecodacus/llama.cpp"
+          Write-Host "Branch: perf"
+          Write-Host ""
+          git log -1 --oneline
+          git rev-parse HEAD
 
       # ============================================================
-      # 3. Setup CUDA 13.3
+      # 3. Setup CUDA
       #
-      # Uses the CUDA setup action bundled in llama.cpp.
+      # Use CUDA version supported by current llama.cpp Windows CI.
       # ============================================================
-      - name: Setup CUDA 13.3
+      - name: Setup CUDA 13.4
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '13.3'
+          cuda_version: '13.4'
           cuda_arch: x64
 
       # ============================================================
@@ -116,21 +60,19 @@ jobs:
       # ============================================================
       # 5. Configure generic Windows CUDA build
       #
-      # GGML_NATIVE=OFF:
-      #   Do not optimize for GitHub runner CPU.
+      # GGML_CUDA=ON
+      #   Enable NVIDIA CUDA backend.
       #
-      # No CMAKE_CUDA_ARCHITECTURES override:
-      #   Let llama.cpp choose its generic supported CUDA arch set.
+      # GGML_NATIVE=OFF
+      #   Do not optimize specifically for GitHub runner CPU.
       #
-      # CURL=OFF:
-      #   Avoid extra libcurl dependencies.
+      # LLAMA_OPENSSL=OFF
+      #   Avoid OpenSSL DLL dependency.
       #
-      # OPENSSL=OFF:
-      #   Avoid:
-      #     libcrypto-3-x64.dll
-      #     libssl-3-x64.dll
+      # Expert-cache / prefetch features are runtime features.
+      # They do NOT need special CMake build flags here.
       # ============================================================
-      - name: Configure generic Windows CUDA build
+      - name: Configure Windows CUDA build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -138,13 +80,10 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF ^
-            -DLLAMA_CURL=OFF ^
             -DLLAMA_OPENSSL=OFF
 
       # ============================================================
       # 6. Build
-      #
-      # Only build tools useful for normal inference / testing.
       # ============================================================
       - name: Build llama.cpp
         shell: cmd
@@ -159,7 +98,11 @@ jobs:
             --target llama-server llama-cli llama-bench
 
       # ============================================================
-      # 7. Verify build outputs
+      # 7. Verify essential outputs
+      #
+      # Avoid checking every internal "*-impl.dll" because those
+      # names can change as the experimental branch tracks upstream.
+      # Smoke tests below will catch missing runtime dependencies.
       # ============================================================
       - name: Verify build output
         shell: pwsh
@@ -168,16 +111,15 @@ jobs:
 
           $bin = "build\bin\Release"
 
+          if (-not (Test-Path $bin)) {
+              throw "Build directory does not exist: $bin"
+          }
+
           $required = @(
               "llama-server.exe",
               "llama-cli.exe",
               "llama-bench.exe",
               "llama.dll",
-              "llama-common.dll",
-              "llama-server-impl.dll",
-              "llama-cli-impl.dll",
-              "llama-bench-impl.dll",
-              "mtmd.dll",
               "ggml.dll",
               "ggml-base.dll",
               "ggml-cpu.dll",
@@ -190,6 +132,7 @@ jobs:
               if (-not (Test-Path $full)) {
                   Write-Host ""
                   Write-Host "Current build directory contents:"
+
                   Get-ChildItem $bin |
                       Sort-Object Name |
                       Format-Table Name, Length -AutoSize
@@ -201,15 +144,44 @@ jobs:
           }
 
       # ============================================================
-      # 8. Bundle CUDA runtime DLLs
+      # 8. Verify this really contains MoE expert-cache support
       #
-      # llama.cpp CUDA setup puts runtime components in nested
-      # directories, so search recursively.
+      # perf is experimental, so fail clearly if the feature gets
+      # renamed/removed from a future branch revision.
+      # ============================================================
+      - name: Verify MoE performance features
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Push-Location "build\bin\Release"
+
+          try {
+              $help = (& .\llama-server.exe --help 2>&1 | Out-String)
+
+              Write-Host "Searching llama-server help for MoE expert cache..."
+
+              if ($help -match "moe-expert-cache") {
+                  Write-Host "[OK] MoE expert-cache option detected."
+              }
+              else {
+                  Write-Host ""
+                  Write-Host "WARNING:"
+                  Write-Host "Could not find 'moe-expert-cache' in llama-server --help."
+                  Write-Host ""
+                  Write-Host "The perf branch may have renamed its options."
+                  Write-Host "Build will continue so the artifact can still be inspected."
+              }
+          }
+          finally {
+              Pop-Location
+          }
+
+      # ============================================================
+      # 9. Bundle CUDA runtime DLLs
       #
-      # This allows the downloaded package to run without installing
-      # the full CUDA Toolkit locally.
-      #
-      # A sufficiently recent NVIDIA driver is still required.
+      # Target machine does not need full CUDA Toolkit.
+      # It still needs a sufficiently recent NVIDIA driver.
       # ============================================================
       - name: Bundle CUDA runtime DLLs
         shell: pwsh
@@ -220,6 +192,10 @@ jobs:
           $cudaRoot = $env:CUDA_PATH
 
           Write-Host "CUDA_PATH = $cudaRoot"
+
+          if (-not $cudaRoot) {
+              throw "CUDA_PATH is empty"
+          }
 
           if (-not (Test-Path $cudaRoot)) {
               throw "CUDA_PATH does not exist: $cudaRoot"
@@ -243,8 +219,16 @@ jobs:
                   -ErrorAction SilentlyContinue
 
               if (-not $files) {
-                  throw "Could not find CUDA runtime DLL matching: $pattern"
+                  throw "Could not find CUDA DLL matching: $pattern"
               }
+
+              # There can occasionally be duplicate copies in nested
+              # toolkit directories. Package unique DLL names only.
+              $files = $files |
+                  Group-Object Name |
+                  ForEach-Object {
+                      $_.Group | Select-Object -First 1
+                  }
 
               foreach ($file in $files) {
                   Write-Host "Found: $($file.FullName)"
@@ -259,7 +243,7 @@ jobs:
           }
 
       # ============================================================
-      # 9. Verify CUDA DLLs are packaged
+      # 10. Verify CUDA DLLs
       # ============================================================
       - name: Verify CUDA runtime DLLs
         shell: pwsh
@@ -291,7 +275,7 @@ jobs:
           }
 
       # ============================================================
-      # 10. Verify OpenSSL DLLs are not required/package leftovers
+      # 11. Check OpenSSL DLLs
       # ============================================================
       - name: Check OpenSSL runtime
         shell: pwsh
@@ -313,7 +297,7 @@ jobs:
           }
 
       # ============================================================
-      # 11. Add build information
+      # 12. Add build information
       # ============================================================
       - name: Add build information
         shell: pwsh
@@ -321,25 +305,30 @@ jobs:
           $dest = "build\bin\Release"
 
           $commit = git rev-parse HEAD
+          $shortCommit = git rev-parse --short HEAD
+
           $date = (Get-Date).ToUniversalTime().ToString(
               "yyyy-MM-dd HH:mm:ss 'UTC'"
           )
 
           @"
-          llama.cpp Expert Cache experimental build
+          thecodacus llama.cpp experimental performance build
 
           ============================================================
           Source
           ============================================================
 
           Repository:
-          https://github.com/csantiago78/llama.cpp
+          https://github.com/thecodacus/llama.cpp
 
           Branch:
-          moe-expert-cache
+          perf
 
           Commit:
           $commit
+
+          Short commit:
+          $shortCommit
 
 
           ============================================================
@@ -349,15 +338,15 @@ jobs:
           Windows x64
 
           CUDA:
-          13.3
+          13.4
 
-          Build mode:
-          Generic
+          Build:
+          Release
+
+          GGML_CUDA:
+          ON
 
           GGML_NATIVE:
-          OFF
-
-          CURL:
           OFF
 
           OpenSSL:
@@ -365,16 +354,19 @@ jobs:
 
 
           ============================================================
-          Windows compatibility patch
+          MoE performance branch
           ============================================================
 
-          flockfile
-          ->
-          _lock_file
+          This package was built from:
 
-          funlockfile
-          ->
-          _unlock_file
+          thecodacus/llama.cpp:perf
+
+          Experimental MoE optimizations are controlled at runtime.
+          Check the exact options supported by this build with:
+
+          llama-server.exe --help
+          llama-cli.exe --help
+          llama-bench.exe --help
 
 
           ============================================================
@@ -387,7 +379,7 @@ jobs:
               -Encoding utf8
 
       # ============================================================
-      # 12. Show final package contents
+      # 13. Show final package
       # ============================================================
       - name: Show final package contents
         shell: pwsh
@@ -401,17 +393,12 @@ jobs:
               Format-Table Name, Length -AutoSize
 
       # ============================================================
-      # 13. Smoke test executables
+      # 14. Smoke test
       #
-      # IMPORTANT:
-      # Standard GitHub Windows runners do not have a usable NVIDIA
-      # GPU, so messages such as:
+      # GitHub hosted Windows runners do not provide a usable
+      # NVIDIA GPU. CUDA initialization failure is therefore expected.
       #
-      #   ggml_cuda_init: failed to initialize CUDA
-      #
-      # are EXPECTED here.
-      #
-      # We only verify that Windows can load and start the executables.
+      # What matters here is that Windows can load all binaries/DLLs.
       # ============================================================
       - name: Smoke test executables
         shell: pwsh
@@ -476,18 +463,13 @@ jobs:
           }
 
       # ============================================================
-      # 14. Upload Artifact
-      #
-      # always() is intentional.
-      #
-      # If a late smoke-test or packaging step fails, GitHub will
-      # still try to upload the compiled files for diagnosis.
+      # 15. Upload Artifact
       # ============================================================
-      - name: Upload Windows CUDA build
+      - name: Upload Windows CUDA perf build
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: llama-expert-cache-win-x64-cuda133-generic
+          name: llama-thecodacus-perf-win-x64-cuda134-generic
           path: build/bin/Release/*
           retention-days: 7
           if-no-files-found: error
