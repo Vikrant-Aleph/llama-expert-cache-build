@@ -1,4 +1,4 @@
-name: Build thecodacus llama.cpp Perf - Windows CUDA Generic
+name: Build Leloch llama.cpp MoE Cache v2 - Windows CUDA
 
 on:
   workflow_dispatch:
@@ -8,37 +8,26 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - CUDA 13.3 - thecodacus perf
+    name: Windows x64 - CUDA 13.3 - Leloch MoE Cache v2
     runs-on: windows-2022
     timeout-minutes: 360
 
-    env:
-      # sccache is used ONLY for normal C/C++ compilation.
-      #
-      # IMPORTANT:
-      # Do NOT use sccache as the CUDA/NVCC compiler launcher.
-      #
-      # sccache 0.18.0 currently has an open bug with llama.cpp's
-      # default PTX-only compute_90 architecture:
-      #
-      #   Missing "cubin" file output
-      #
-      # CUDA therefore uses nvcc directly.
-      SCCACHE_GHA_ENABLED: "true"
-
     steps:
       # ============================================================
-      # 1. Checkout latest thecodacus perf branch
+      # 1. Checkout latest leloch MoE Cache v2 branch
       #
-      # Every NEW workflow run pulls the current HEAD of:
+      # Every new workflow run pulls the current HEAD of:
       #
-      #   thecodacus/llama.cpp:perf
+      #   leloch/llama.cpp:moe-cache-v2-pr
+      #
+      # This branch implements adaptive runtime MoE expert caching.
+      # No offline CSV/profile is required.
       # ============================================================
-      - name: Checkout thecodacus perf branch
+      - name: Checkout Leloch MoE Cache v2
         uses: actions/checkout@v6
         with:
-          repository: thecodacus/llama.cpp
-          ref: perf
+          repository: leloch/llama.cpp
+          ref: moe-cache-v2-pr
           fetch-depth: 1
 
 
@@ -46,53 +35,53 @@ jobs:
       # 2. Show exact source revision
       # ============================================================
       - name: Show source revision
-        id: source
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $commit = (git rev-parse HEAD).Trim()
-          $shortCommit = (git rev-parse --short HEAD).Trim()
-
           Write-Host ""
           Write-Host "========================================"
-          Write-Host "Source revision"
+          Write-Host "Source"
           Write-Host "========================================"
           Write-Host ""
 
           Write-Host "Repository:"
-          Write-Host "thecodacus/llama.cpp"
+          Write-Host "https://github.com/leloch/llama.cpp"
 
           Write-Host ""
           Write-Host "Branch:"
-          Write-Host "perf"
+          Write-Host "moe-cache-v2-pr"
 
           Write-Host ""
           Write-Host "Commit:"
-          Write-Host $commit
+          git rev-parse HEAD
 
           Write-Host ""
+          Write-Host "Latest commit:"
           git log -1 --oneline
-
-          "commit=$commit" >> $env:GITHUB_OUTPUT
-          "short_commit=$shortCommit" >> $env:GITHUB_OUTPUT
 
 
       # ============================================================
       # 3. Setup CUDA 13.3
       #
-      # Use the CUDA setup action included with the perf branch.
-      # This branch currently supports CUDA 13.3 x64.
+      # IMPORTANT:
+      #
+      # This uses the CUDA setup action contained in the checked-out
+      # Leloch branch itself.
+      #
+      # That action currently supports CUDA 13.3 x64.
       # ============================================================
       - name: Setup CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: '13.3'
-          cuda_arch: x64
 
 
       # ============================================================
       # 4. Verify CUDA installation
+      #
+      # Prevent the workflow from reaching CMake if the CUDA setup
+      # action did not actually install/configure nvcc.
       # ============================================================
       - name: Verify CUDA installation
         shell: pwsh
@@ -116,11 +105,12 @@ jobs:
               throw "CUDA_PATH does not exist: $env:CUDA_PATH"
           }
 
-          Write-Host "nvcc location:"
-          Get-Command nvcc -ErrorAction Stop
+          $nvcc = Get-Command nvcc -ErrorAction Stop
+
+          Write-Host "nvcc:"
+          Write-Host $nvcc.Source
 
           Write-Host ""
-          Write-Host "nvcc version:"
           nvcc --version
 
           if ($LASTEXITCODE -ne 0) {
@@ -142,87 +132,33 @@ jobs:
           choco install ninja -y --no-progress
 
           Write-Host ""
-          Write-Host "Ninja version:"
+          Write-Host "Ninja:"
           ninja --version
 
 
       # ============================================================
-      # 6. Setup sccache
-      #
-      # IMPORTANT:
-      #
-      # sccache is used ONLY for:
-      #
-      #   C
-      #   C++
-      #
-      # CUDA/NVCC is deliberately NOT wrapped by sccache.
-      # ============================================================
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.18.0"
-
-
-      # ============================================================
-      # 7. Verify sccache
-      # ============================================================
-      - name: Verify sccache
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "sccache"
-          Write-Host "========================================"
-          Write-Host ""
-
-          $sccache = Get-Command sccache -ErrorAction Stop
-
-          Write-Host "sccache location:"
-          Write-Host $sccache.Source
-
-          Write-Host ""
-          Write-Host "sccache version:"
-          sccache --version
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "sccache --version failed."
-          }
-
-          Write-Host ""
-          Write-Host "Initial cache statistics:"
-          sccache --show-stats
-
-
-      # ============================================================
-      # 8. Configure generic Windows CUDA build
+      # 6. Configure generic Windows CUDA build
       #
       # GGML_CUDA=ON
       #   Enable NVIDIA CUDA backend.
       #
       # GGML_NATIVE=OFF
-      #   Do not optimize specifically for the GitHub runner CPU.
-      #
-      # LLAMA_CURL=OFF
-      #   Avoid unnecessary curl dependencies.
+      #   Do not optimize for the GitHub runner CPU.
       #
       # LLAMA_OPENSSL=OFF
-      #   Avoid OpenSSL runtime DLL dependencies.
+      #   Avoid OpenSSL DLL dependencies.
       #
-      # CMAKE_C_COMPILER_LAUNCHER=sccache
-      # CMAKE_CXX_COMPILER_LAUNCHER=sccache
-      #
-      #   Cache normal C/C++ compilation.
+      # LLAMA_BUILD_TESTS=OFF
+      #   Avoid spending build time on tests.
       #
       # IMPORTANT:
       #
-      # There is intentionally NO:
+      # No special compile option is required for --moe-cache.
+      # The MoE cache implementation is part of this branch.
       #
-      #   CMAKE_CUDA_COMPILER_LAUNCHER=sccache
-      #
-      # CUDA must go directly through NVCC.
+      # We deliberately do NOT wrap NVCC with sccache because of
+      # previously encountered PTX / "Missing cubin file output"
+      # problems with CUDA compilation.
       # ============================================================
       - name: Configure Windows CUDA build
         shell: cmd
@@ -245,45 +181,41 @@ jobs:
           if errorlevel 1 exit /b 1
 
           echo.
-          where sccache
-          if errorlevel 1 exit /b 1
-
-          sccache --version
-          if errorlevel 1 exit /b 1
+          cmake --version
 
           echo.
-          cmake --version
           ninja --version
+
+          echo.
+          echo ========================================
+          echo Configure CMake
+          echo ========================================
           echo.
 
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF ^
-            -DLLAMA_CURL=OFF ^
             -DLLAMA_OPENSSL=OFF ^
-            -DCUDAToolkit_ROOT="%CUDA_PATH%" ^
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DCUDAToolkit_ROOT="%CUDA_PATH%"
 
           if errorlevel 1 exit /b 1
 
 
       # ============================================================
-      # 9. Build
+      # 7. Build
       #
-      # CUDA is compiled directly by nvcc.
-      #
-      # This avoids the current sccache + PTX compute_90 bug.
+      # Build the binaries normally useful for inference and
+      # performance testing.
       # ============================================================
       - name: Build llama.cpp
-        id: build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
           echo.
           echo ========================================
-          echo Build
+          echo Building
           echo ========================================
           echo.
 
@@ -299,32 +231,11 @@ jobs:
 
 
       # ============================================================
-      # 10. Show sccache statistics
+      # 8. Verify essential output files
       #
-      # Only C/C++ compilation is expected in the cache.
+      # Only check stable/core names.
       #
-      # CUDA cache entries should be zero because NVCC bypasses
-      # sccache intentionally.
-      # ============================================================
-      - name: Show sccache statistics
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "sccache statistics"
-          Write-Host "========================================"
-          Write-Host ""
-
-          sccache --show-stats
-
-          exit 0
-
-
-      # ============================================================
-      # 11. Verify essential build outputs
+      # Experimental branches may change internal *-impl.dll names.
       # ============================================================
       - name: Verify build output
         shell: pwsh
@@ -354,7 +265,7 @@ jobs:
               if (-not (Test-Path $full)) {
                   Write-Host ""
                   Write-Host "========================================"
-                  Write-Host "Current build directory contents"
+                  Write-Host "Current build directory"
                   Write-Host "========================================"
                   Write-Host ""
 
@@ -370,12 +281,57 @@ jobs:
 
 
       # ============================================================
-      # 12. Bundle CUDA runtime DLLs
+      # 9. Verify adaptive MoE Cache exists
       #
-      # Allows the downloaded package to run without installing the
-      # complete CUDA Toolkit on the destination PC.
+      # Search the source itself.
       #
-      # A sufficiently recent NVIDIA driver is still required.
+      # This avoids treating an unusual --help exit code as a build
+      # failure while still confirming we really built the intended
+      # experimental branch.
+      # ============================================================
+      - name: Verify adaptive MoE Cache source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Verify adaptive MoE Cache"
+          Write-Host "========================================"
+          Write-Host ""
+
+          $argFile = "common\arg.cpp"
+
+          if (-not (Test-Path $argFile)) {
+              throw "Cannot find $argFile"
+          }
+
+          $text = [System.IO.File]::ReadAllText($argFile)
+
+          if (-not $text.Contains('"--moe-cache"')) {
+              throw "This source revision does not expose --moe-cache"
+          }
+
+          if (-not $text.Contains("adaptively cache the hottest")) {
+              Write-Host "Warning: --moe-cache exists but description changed."
+          }
+
+          Write-Host "[OK] --moe-cache detected in source."
+
+
+      # ============================================================
+      # 10. Bundle CUDA runtime DLLs
+      #
+      # Target PC should not need the full CUDA Toolkit.
+      #
+      # It still requires a sufficiently recent NVIDIA driver.
+      #
+      # Required:
+      #   cudart
+      #   cublas
+      #   cublasLt
+      #
+      # Optional runtime components are also copied when present.
       # ============================================================
       - name: Bundle CUDA runtime DLLs
         shell: pwsh
@@ -401,15 +357,20 @@ jobs:
               throw "CUDA_PATH does not exist: $cudaRoot"
           }
 
-          $patterns = @(
+
+          # --------------------------------------------------------
+          # Required DLLs
+          # --------------------------------------------------------
+          $requiredPatterns = @(
               "cudart64_*.dll",
               "cublas64_*.dll",
               "cublasLt64_*.dll"
           )
 
-          foreach ($pattern in $patterns) {
+          foreach ($pattern in $requiredPatterns) {
               Write-Host ""
-              Write-Host "Searching for $pattern"
+              Write-Host "Searching required DLL:"
+              Write-Host "  $pattern"
 
               $files = Get-ChildItem `
                   -Path $cudaRoot `
@@ -419,13 +380,9 @@ jobs:
                   -ErrorAction SilentlyContinue
 
               if (-not $files) {
-                  throw "Could not find CUDA runtime DLL matching: $pattern"
+                  throw "Could not find required CUDA DLL: $pattern"
               }
 
-              # CUDA installation directories can contain duplicate
-              # copies of the same DLL filename.
-              #
-              # Keep one copy for each unique filename.
               $uniqueFiles = $files |
                   Group-Object Name |
                   ForEach-Object {
@@ -433,22 +390,64 @@ jobs:
                   }
 
               foreach ($file in $uniqueFiles) {
-                  Write-Host "Found:"
-                  Write-Host "  $($file.FullName)"
-
                   Copy-Item `
                       -Path $file.FullName `
                       -Destination $dest `
                       -Force
 
-                  Write-Host "Copied:"
-                  Write-Host "  $($file.Name)"
+                  Write-Host "[COPIED] $($file.Name)"
+              }
+          }
+
+
+          # --------------------------------------------------------
+          # Optional CUDA runtime DLLs
+          #
+          # Some revisions/features may use these.
+          # Copy them when available, but don't fail if absent.
+          # --------------------------------------------------------
+          $optionalPatterns = @(
+              "nvrtc64_*.dll",
+              "nvrtc-builtins64_*.dll",
+              "nvJitLink_*.dll"
+          )
+
+          foreach ($pattern in $optionalPatterns) {
+              Write-Host ""
+              Write-Host "Searching optional DLL:"
+              Write-Host "  $pattern"
+
+              $files = Get-ChildItem `
+                  -Path $cudaRoot `
+                  -Recurse `
+                  -File `
+                  -Filter $pattern `
+                  -ErrorAction SilentlyContinue
+
+              if (-not $files) {
+                  Write-Host "Not found. Continuing."
+                  continue
+              }
+
+              $uniqueFiles = $files |
+                  Group-Object Name |
+                  ForEach-Object {
+                      $_.Group | Select-Object -First 1
+                  }
+
+              foreach ($file in $uniqueFiles) {
+                  Copy-Item `
+                      -Path $file.FullName `
+                      -Destination $dest `
+                      -Force
+
+                  Write-Host "[COPIED] $($file.Name)"
               }
           }
 
 
       # ============================================================
-      # 13. Verify packaged CUDA runtime DLLs
+      # 11. Verify required CUDA runtime DLLs
       # ============================================================
       - name: Verify CUDA runtime DLLs
         shell: pwsh
@@ -464,20 +463,130 @@ jobs:
           )
 
           foreach ($pattern in $patterns) {
-              $found = Get-ChildItem `
+              $files = Get-ChildItem `
                   -Path $bin `
                   -Filter $pattern `
                   -File `
                   -ErrorAction SilentlyContinue
 
-              if (-not $found) {
+              if (-not $files) {
                   throw "Missing packaged CUDA DLL: $pattern"
               }
 
-              foreach ($file in $found) {
+              foreach ($file in $files) {
                   Write-Host "[OK] $($file.Name)"
               }
           }
+
+
+      # ============================================================
+      # 12. Save exact command-line help
+      #
+      # This experimental branch can change CLI options over time.
+      #
+      # Save --help with the artifact so the exact options supported
+      # by the downloaded build can always be inspected later.
+      #
+      # A nonzero --help exit code is informational only.
+      # ============================================================
+      - name: Save command line help
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          Push-Location "build\bin\Release"
+
+          try {
+              Write-Host ""
+              Write-Host "Saving llama-server help..."
+
+              & .\llama-server.exe --help *>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-SERVER-HELP.txt" `
+                      -Encoding utf8
+
+              Write-Host "Exit code: $LASTEXITCODE"
+
+
+              Write-Host ""
+              Write-Host "Saving llama-cli help..."
+
+              & .\llama-cli.exe --help *>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-CLI-HELP.txt" `
+                      -Encoding utf8
+
+              Write-Host "Exit code: $LASTEXITCODE"
+
+
+              Write-Host ""
+              Write-Host "Saving llama-bench help..."
+
+              & .\llama-bench.exe --help *>&1 |
+                  Out-File `
+                      -FilePath "LLAMA-BENCH-HELP.txt" `
+                      -Encoding utf8
+
+              Write-Host "Exit code: $LASTEXITCODE"
+          }
+          finally {
+              Pop-Location
+          }
+
+          $global:LASTEXITCODE = 0
+          exit 0
+
+
+      # ============================================================
+      # 13. Extract MoE Cache help lines
+      #
+      # Makes it easy to inspect the cache options after download.
+      # ============================================================
+      - name: Save MoE Cache options
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $bin = "build\bin\Release"
+          $helpFile = Join-Path $bin "LLAMA-SERVER-HELP.txt"
+          $outFile = Join-Path $bin "MOE-CACHE-OPTIONS.txt"
+
+          if (-not (Test-Path $helpFile)) {
+              "Could not generate llama-server help." |
+                  Out-File $outFile -Encoding utf8
+
+              exit 0
+          }
+
+          $lines = Get-Content $helpFile
+
+          $matches = $lines |
+              Select-String `
+                  -Pattern "moe-cache|cpu-moe|n-cpu-moe" `
+                  -Context 1,3
+
+          @"
+          Leloch llama.cpp MoE Cache v2
+
+          Relevant command-line options from this exact build:
+
+          ============================================================
+
+          $($matches | Out-String)
+          "@ | Out-File `
+              -FilePath $outFile `
+              -Encoding utf8
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "MoE Cache options"
+          Write-Host "========================================"
+          Write-Host ""
+
+          Get-Content $outFile
+
+          exit 0
 
 
       # ============================================================
@@ -504,117 +613,7 @@ jobs:
 
 
       # ============================================================
-      # 15. Inspect MoE / Expert Cache source markers
-      #
-      # INFORMATIONAL ONLY.
-      #
-      # This step must never make a successful build fail.
-      # ============================================================
-      - name: Inspect MoE performance feature markers
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          $PSNativeCommandUseErrorActionPreference = $false
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "MoE / Expert Cache source inspection"
-          Write-Host "========================================"
-          Write-Host ""
-
-          $patterns = @(
-              "expert.cache",
-              "expert_cache",
-              "prefetch.*expert",
-              "GGML_CUDA_REGISTER_HOST"
-          )
-
-          foreach ($pattern in $patterns) {
-              Write-Host ""
-              Write-Host "Searching source for:"
-              Write-Host "  $pattern"
-
-              $result = git grep -n -i -E $pattern 2>$null
-
-              if ($LASTEXITCODE -eq 0 -and $result) {
-                  $result |
-                      Select-Object -First 30 |
-                      ForEach-Object {
-                          Write-Host $_
-                      }
-              }
-              else {
-                  Write-Host "No matches found."
-              }
-          }
-
-          Write-Host ""
-          Write-Host "Feature inspection is informational only."
-
-          $global:LASTEXITCODE = 0
-          exit 0
-
-
-      # ============================================================
-      # 16. Save command-line help
-      #
-      # Some experimental builds return a nonzero exit code for
-      # --help.
-      #
-      # This step is informational and must NOT fail the workflow.
-      # ============================================================
-      - name: Save command line help
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          $PSNativeCommandUseErrorActionPreference = $false
-
-          Push-Location "build\bin\Release"
-
-          try {
-              Write-Host ""
-              Write-Host "Saving llama-server help..."
-
-              & .\llama-server.exe --help *>&1 |
-                  Out-File `
-                      -FilePath "LLAMA-SERVER-HELP.txt" `
-                      -Encoding utf8
-
-              Write-Host "llama-server --help exit code: $LASTEXITCODE"
-
-
-              Write-Host ""
-              Write-Host "Saving llama-cli help..."
-
-              & .\llama-cli.exe --help *>&1 |
-                  Out-File `
-                      -FilePath "LLAMA-CLI-HELP.txt" `
-                      -Encoding utf8
-
-              Write-Host "llama-cli --help exit code: $LASTEXITCODE"
-
-
-              Write-Host ""
-              Write-Host "Saving llama-bench help..."
-
-              & .\llama-bench.exe --help *>&1 |
-                  Out-File `
-                      -FilePath "LLAMA-BENCH-HELP.txt" `
-                      -Encoding utf8
-
-              Write-Host "llama-bench --help exit code: $LASTEXITCODE"
-          }
-          finally {
-              Pop-Location
-          }
-
-          $global:LASTEXITCODE = 0
-
-          exit 0
-
-
-      # ============================================================
-      # 17. Add BUILD-INFO.txt
+      # 15. Add BUILD-INFO.txt
       # ============================================================
       - name: Add build information
         shell: pwsh
@@ -625,7 +624,6 @@ jobs:
 
           $commit = (git rev-parse HEAD).Trim()
           $shortCommit = (git rev-parse --short HEAD).Trim()
-
           $commitInfo = git log -1 --pretty=format:"%h %s"
 
           $date = (Get-Date).ToUniversalTime().ToString(
@@ -633,7 +631,7 @@ jobs:
           )
 
           @"
-          thecodacus llama.cpp experimental performance build
+          Leloch llama.cpp MoE Cache v2 experimental build
 
 
           ============================================================
@@ -641,10 +639,10 @@ jobs:
           ============================================================
 
           Repository:
-          https://github.com/thecodacus/llama.cpp
+          https://github.com/leloch/llama.cpp
 
           Branch:
-          perf
+          moe-cache-v2-pr
 
           Commit:
           $commit
@@ -666,7 +664,7 @@ jobs:
           Runner:
           windows-2022
 
-          Build configuration:
+          Build:
           Release
 
           CUDA:
@@ -678,57 +676,77 @@ jobs:
           GGML_NATIVE:
           OFF
 
-          CURL:
-          OFF
-
           OpenSSL:
           OFF
 
 
           ============================================================
-          Compiler cache
+          Adaptive MoE Expert Cache
           ============================================================
 
-          sccache:
-          enabled for C and C++ only
+          This build contains Leloch's adaptive runtime MoE expert
+          cache.
 
-          CUDA/NVCC sccache:
-          disabled
+          No offline CSV routing profile is required.
 
-          Reason:
+          Relevant option:
 
-          sccache 0.18.0 has an open issue with llama.cpp's
-          PTX-only compute_90 CUDA architecture.
+          --moe-cache MODE
 
-          The failure appears as:
 
-          Missing "cubin" file output
+          MODE examples:
 
-          CUDA compilation therefore uses NVCC directly.
+          auto
+              Automatically use spare VRAM while preserving normal
+              weight repacking behavior.
+
+          on
+              Enable adaptive cache with an automatically selected
+              VRAM budget.
+
+          off
+          0
+              Disable MoE expert cache.
+
+          N
+              Explicit VRAM cache budget in MiB PER DEVICE.
+
+              Example:
+
+              --moe-cache 12000
+
+              means approximately 12000 MiB cache budget per GPU,
+              subject to the cache's actual available-VRAM limits.
+
+
+          The cache dynamically learns which CPU-resident experts are
+          hot while inference is running and caches them in VRAM.
 
 
           ============================================================
-          MoE performance branch
+          Useful starting configuration
           ============================================================
 
-          This package was built from:
+          For a MoE model:
 
-          thecodacus/llama.cpp:perf
-
-
-          This is an experimental performance branch.
-
-          The exact Expert Cache / prefetch / pinned-memory behavior
-          depends on the source commit listed above.
+          -ngl all
+          -ncmoe 99
+          --moe-cache auto
 
 
-          Check:
+          Alternatively specify the cache budget manually:
 
-          LLAMA-SERVER-HELP.txt
-          LLAMA-CLI-HELP.txt
-          LLAMA-BENCH-HELP.txt
+          -ngl all
+          -ncmoe 99
+          --moe-cache 12000
 
-          for command-line options exposed by this exact build.
+
+          Always leave enough VRAM for:
+
+          KV cache
+          compute buffers
+          CUDA runtime
+          context growth
 
 
           ============================================================
@@ -737,10 +755,27 @@ jobs:
 
           CUDA runtime DLLs are bundled with this package.
 
-          Installing the complete CUDA Toolkit on the destination
-          Windows machine should therefore not be required.
+          A full CUDA Toolkit installation on the destination machine
+          should therefore not be required.
 
           A sufficiently recent NVIDIA driver is still required.
+
+
+          ============================================================
+          Files
+          ============================================================
+
+          LLAMA-SERVER-HELP.txt
+              Complete server help from this exact build.
+
+          LLAMA-CLI-HELP.txt
+              Complete CLI help.
+
+          LLAMA-BENCH-HELP.txt
+              Benchmark help.
+
+          MOE-CACHE-OPTIONS.txt
+              Extracted MoE-related options.
 
 
           ============================================================
@@ -754,7 +789,7 @@ jobs:
 
 
       # ============================================================
-      # 18. Show final package contents
+      # 16. Show final package contents
       # ============================================================
       - name: Show final package contents
         shell: pwsh
@@ -771,16 +806,19 @@ jobs:
 
 
       # ============================================================
-      # 19. Smoke test executables
+      # 17. Smoke test executables
       #
-      # Standard GitHub Windows runners do not provide a usable
-      # NVIDIA GPU.
+      # GitHub-hosted Windows runners do NOT have a usable NVIDIA
+      # GPU.
       #
-      # Therefore this is primarily a Windows executable/DLL load
-      # test.
+      # Therefore this primarily verifies:
+      #
+      #   - executable starts
+      #   - Windows DLL loader succeeds
+      #   - packaged dependencies are present
       #
       # Small positive exit codes are tolerated because experimental
-      # builds can return nonzero when no CUDA device is available.
+      # builds can behave differently when no GPU is present.
       # ============================================================
       - name: Smoke test executables
         shell: pwsh
@@ -821,15 +859,14 @@ jobs:
                       return
                   }
 
-                  # Tolerate normal small nonzero exit codes.
                   if ($code -ge 1 -and $code -le 10) {
-                      Write-Host "Warning: $Exe started but returned $code."
-                      Write-Host "This is tolerated on the GitHub hosted runner."
+                      Write-Host ""
+                      Write-Host "Warning:"
+                      Write-Host "$Exe started but returned exit code $code."
+                      Write-Host "This is tolerated on the GPU-less GitHub runner."
                       return
                   }
 
-                  # Large/negative codes are more likely to indicate
-                  # loader failures, crashes or Windows NTSTATUS.
                   throw "$Exe failed abnormally with exit code $code"
               }
 
@@ -847,23 +884,22 @@ jobs:
           }
 
           $global:LASTEXITCODE = 0
-
           exit 0
 
 
       # ============================================================
-      # 20. Upload Artifact
+      # 18. Upload Artifact
       #
       # always() is intentional.
       #
-      # If compilation or a late packaging check fails, GitHub still
-      # attempts to upload any useful generated files.
+      # If a late packaging/smoke-test step fails, GitHub still
+      # attempts to upload useful compiled files for diagnosis.
       # ============================================================
-      - name: Upload Windows CUDA perf build
+      - name: Upload Windows CUDA MoE Cache build
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: llama-thecodacus-perf-win-x64-cuda133-generic
+          name: llama-leloch-moe-cache-v2-win-x64-cuda133
           path: build/bin/Release/*
           retention-days: 7
           if-no-files-found: warn
